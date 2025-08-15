@@ -6,6 +6,8 @@
 (define-constant ERR_SUBSCRIPTION_ALREADY_EXISTS (err u106))
 (define-constant ERR_INVALID_AMOUNT (err u107))
 (define-constant ERR_INVALID_INTERVAL (err u108))
+(define-constant ERR_SUBSCRIPTION_PAUSED (err u109))
+(define-constant ERR_SUBSCRIPTION_NOT_PAUSED (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var subscription-counter uint u0)
@@ -21,7 +23,10 @@
     last-payment: uint,
     next-payment: uint,
     is-active: bool,
-    total-payments: uint
+    total-payments: uint,
+    is-paused: bool,
+    paused-at: uint,
+    total-pause-time: uint
   }
 )
 
@@ -71,8 +76,16 @@
     subscription 
       (and 
         (get is-active subscription)
+        (not (get is-paused subscription))
         (>= stacks-block-height (get next-payment subscription))
       )
+    false
+  )
+)
+
+(define-read-only (is-subscription-paused (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription (get is-paused subscription)
     false
   )
 )
@@ -123,7 +136,10 @@
         last-payment: u0,
         next-payment: (+ current-time interval),
         is-active: true,
-        total-payments: u0
+        total-payments: u0,
+        is-paused: false,
+        paused-at: u0,
+        total-pause-time: u0
       }
     )
     
@@ -157,6 +173,7 @@
         (provider-balance (get-user-balance provider))
       )
         (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
+        (asserts! (not (get is-paused subscription)) ERR_SUBSCRIPTION_PAUSED)
         (asserts! (>= stacks-block-height (get next-payment subscription)) ERR_PAYMENT_TOO_EARLY)
         (asserts! (>= subscriber-balance amount) ERR_INSUFFICIENT_BALANCE)
         
@@ -204,6 +221,56 @@
   )
 )
 
+(define-public (pause-subscription (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription
+      (begin
+        (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
+        (asserts! (not (get is-paused subscription)) ERR_SUBSCRIPTION_PAUSED)
+        
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          (merge subscription {
+            is-paused: true,
+            paused-at: stacks-block-height
+          })
+        )
+        
+        (ok true)
+      )
+    ERR_SUBSCRIPTION_NOT_FOUND
+  )
+)
+
+(define-public (resume-subscription (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription
+      (let (
+        (pause-duration (- stacks-block-height (get paused-at subscription)))
+        (new-total-pause (+ (get total-pause-time subscription) pause-duration))
+        (adjusted-next-payment (+ (get next-payment subscription) pause-duration))
+      )
+        (asserts! (is-eq tx-sender (get subscriber subscription)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
+        (asserts! (get is-paused subscription) ERR_SUBSCRIPTION_NOT_PAUSED)
+        
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          (merge subscription {
+            is-paused: false,
+            paused-at: u0,
+            total-pause-time: new-total-pause,
+            next-payment: adjusted-next-payment
+          })
+        )
+        
+        (ok true)
+      )
+    ERR_SUBSCRIPTION_NOT_FOUND
+  )
+)
+
 (define-public (batch-process-payments (subscription-ids (list 20 uint)))
   (let ((results (map process-payment subscription-ids)))
     (ok results)
@@ -215,9 +282,11 @@
     subscription
       (ok {
         is-active: (get is-active subscription),
+        is-paused: (get is-paused subscription),
         payment-due: (is-payment-due subscription-id),
         next-payment: (get next-payment subscription),
         total-payments: (get total-payments subscription),
+        total-pause-time: (get total-pause-time subscription),
         time-until-next: (if (>= stacks-block-height (get next-payment subscription))
                            u0
                            (- (get next-payment subscription) stacks-block-height))
