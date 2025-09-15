@@ -8,9 +8,12 @@
 (define-constant ERR_INVALID_INTERVAL (err u108))
 (define-constant ERR_SUBSCRIPTION_PAUSED (err u109))
 (define-constant ERR_SUBSCRIPTION_NOT_PAUSED (err u110))
+(define-constant ERR_IN_GRACE_PERIOD (err u111))
+(define-constant ERR_GRACE_PERIOD_EXPIRED (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var subscription-counter uint u0)
+(define-data-var default-grace-period uint u432)
 
 (define-map subscriptions
   { subscription-id: uint }
@@ -26,7 +29,11 @@
     total-payments: uint,
     is-paused: bool,
     paused-at: uint,
-    total-pause-time: uint
+    total-pause-time: uint,
+    in-grace-period: bool,
+    grace-period-start: uint,
+    grace-period-end: uint,
+    failed-payment-attempts: uint
   }
 )
 
@@ -139,7 +146,11 @@
         total-payments: u0,
         is-paused: false,
         paused-at: u0,
-        total-pause-time: u0
+        total-pause-time: u0,
+        in-grace-period: false,
+        grace-period-start: u0,
+        grace-period-end: u0,
+        failed-payment-attempts: u0
       }
     )
     
@@ -171,32 +182,53 @@
         (interval (get interval subscription))
         (subscriber-balance (get-user-balance subscriber))
         (provider-balance (get-user-balance provider))
+        (grace-period (var-get default-grace-period))
       )
         (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
         (asserts! (not (get is-paused subscription)) ERR_SUBSCRIPTION_PAUSED)
         (asserts! (>= stacks-block-height (get next-payment subscription)) ERR_PAYMENT_TOO_EARLY)
-        (asserts! (>= subscriber-balance amount) ERR_INSUFFICIENT_BALANCE)
         
-        (map-set user-balances
-          { user: subscriber }
-          { balance: (- subscriber-balance amount) }
+        (if (>= subscriber-balance amount)
+          (begin
+            (map-set user-balances
+              { user: subscriber }
+              { balance: (- subscriber-balance amount) }
+            )
+            
+            (map-set user-balances
+              { user: provider }
+              { balance: (+ provider-balance amount) }
+            )
+            
+            (map-set subscriptions
+              { subscription-id: subscription-id }
+              (merge subscription {
+                last-payment: stacks-block-height,
+                next-payment: (+ stacks-block-height interval),
+                total-payments: (+ (get total-payments subscription) u1),
+                in-grace-period: false,
+                grace-period-start: u0,
+                grace-period-end: u0,
+                failed-payment-attempts: u0
+              })
+            )
+            
+            (ok amount)
+          )
+          (begin
+            (map-set subscriptions
+              { subscription-id: subscription-id }
+              (merge subscription {
+                in-grace-period: true,
+                grace-period-start: stacks-block-height,
+                grace-period-end: (+ stacks-block-height grace-period),
+                failed-payment-attempts: (+ (get failed-payment-attempts subscription) u1)
+              })
+            )
+            
+            ERR_INSUFFICIENT_BALANCE
+          )
         )
-        
-        (map-set user-balances
-          { user: provider }
-          { balance: (+ provider-balance amount) }
-        )
-        
-        (map-set subscriptions
-          { subscription-id: subscription-id }
-          (merge subscription {
-            last-payment: stacks-block-height,
-            next-payment: (+ stacks-block-height interval),
-            total-payments: (+ (get total-payments subscription) u1)
-          })
-        )
-        
-        (ok amount)
       )
     ERR_SUBSCRIPTION_NOT_FOUND
   )
@@ -271,6 +303,102 @@
   )
 )
 
+(define-public (retry-payment (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription
+      (let (
+        (subscriber (get subscriber subscription))
+        (provider (get provider subscription))
+        (amount (get amount subscription))
+        (interval (get interval subscription))
+        (subscriber-balance (get-user-balance subscriber))
+        (provider-balance (get-user-balance provider))
+      )
+        (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
+        (asserts! (get in-grace-period subscription) ERR_NOT_AUTHORIZED)
+        (asserts! (<= stacks-block-height (get grace-period-end subscription)) ERR_GRACE_PERIOD_EXPIRED)
+        (asserts! (>= subscriber-balance amount) ERR_INSUFFICIENT_BALANCE)
+        
+        (map-set user-balances
+          { user: subscriber }
+          { balance: (- subscriber-balance amount) }
+        )
+        
+        (map-set user-balances
+          { user: provider }
+          { balance: (+ provider-balance amount) }
+        )
+        
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          (merge subscription {
+            last-payment: stacks-block-height,
+            next-payment: (+ stacks-block-height interval),
+            total-payments: (+ (get total-payments subscription) u1),
+            in-grace-period: false,
+            grace-period-start: u0,
+            grace-period-end: u0,
+            failed-payment-attempts: u0
+          })
+        )
+        
+        (ok amount)
+      )
+    ERR_SUBSCRIPTION_NOT_FOUND
+  )
+)
+
+(define-public (expire-subscription (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription
+      (begin
+        (asserts! (get in-grace-period subscription) ERR_NOT_AUTHORIZED)
+        (asserts! (> stacks-block-height (get grace-period-end subscription)) ERR_IN_GRACE_PERIOD)
+        
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          (merge subscription {
+            is-active: false,
+            in-grace-period: false
+          })
+        )
+        
+        (ok true)
+      )
+    ERR_SUBSCRIPTION_NOT_FOUND
+  )
+)
+
+(define-read-only (is-in-grace-period (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription 
+      (and 
+        (get in-grace-period subscription)
+        (<= stacks-block-height (get grace-period-end subscription))
+      )
+    false
+  )
+)
+
+(define-read-only (get-grace-period-remaining (subscription-id uint))
+  (match (get-subscription subscription-id)
+    subscription
+      (if (is-in-grace-period subscription-id)
+        (- (get grace-period-end subscription) stacks-block-height)
+        u0
+      )
+    u0
+  )
+)
+
+(define-public (set-grace-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set default-grace-period new-period)
+    (ok new-period)
+  )
+)
+
 (define-public (batch-process-payments (subscription-ids (list 20 uint)))
   (let ((results (map process-payment subscription-ids)))
     (ok results)
@@ -283,10 +411,13 @@
       (ok {
         is-active: (get is-active subscription),
         is-paused: (get is-paused subscription),
+        in-grace-period: (is-in-grace-period subscription-id),
         payment-due: (is-payment-due subscription-id),
         next-payment: (get next-payment subscription),
         total-payments: (get total-payments subscription),
         total-pause-time: (get total-pause-time subscription),
+        failed-payment-attempts: (get failed-payment-attempts subscription),
+        grace-period-remaining: (get-grace-period-remaining subscription-id),
         time-until-next: (if (>= stacks-block-height (get next-payment subscription))
                            u0
                            (- (get next-payment subscription) stacks-block-height))
