@@ -15,6 +15,10 @@
 (define-constant ERR_INVALID_TIER_PRICE (err u115))
 (define-constant ERR_SAME_TIER (err u116))
 
+(define-constant ERR_INVALID_SPLIT_BPS (err u117))
+(define-constant ERR_INVALID_SPLIT_RECEIVER (err u118))
+(define-constant BPS_DENOMINATOR u10000)
+
 (define-data-var contract-owner principal tx-sender)
 (define-data-var subscription-counter uint u0)
 (define-data-var default-grace-period uint u432)
@@ -49,6 +53,11 @@
 (define-map provider-subscriptions
   { provider: principal }
   { subscription-ids: (list 100 uint) }
+)
+
+(define-map provider-revenue-split
+  { provider: principal }
+  { receiver: principal, bps: uint }
 )
 
 (define-map user-balances
@@ -121,6 +130,10 @@
   )
 )
 
+(define-read-only (get-provider-split (provider principal))
+  (map-get? provider-revenue-split { provider: provider })
+)
+
 (define-read-only (is-payment-due (subscription-id uint))
   (match (get-subscription subscription-id)
     subscription 
@@ -177,6 +190,26 @@
       }
     )
     (ok tier-id)
+  )
+)
+
+(define-public (set-provider-split (receiver principal) (bps uint))
+  (begin
+    (asserts! (> bps u0) ERR_INVALID_SPLIT_BPS)
+    (asserts! (<= bps BPS_DENOMINATOR) ERR_INVALID_SPLIT_BPS)
+    (asserts! (not (is-eq receiver tx-sender)) ERR_INVALID_SPLIT_RECEIVER)
+    (map-set provider-revenue-split
+      { provider: tx-sender }
+      { receiver: receiver, bps: bps }
+    )
+    (ok true)
+  )
+)
+
+(define-public (clear-provider-split)
+  (begin
+    (map-delete provider-revenue-split { provider: tx-sender })
+    (ok true)
   )
 )
 
@@ -278,6 +311,12 @@
         (interval (get interval subscription))
         (subscriber-balance (get-user-balance subscriber))
         (provider-balance (get-user-balance provider))
+        (split-entry (map-get? provider-revenue-split { provider: provider }))
+        (receiver (match split-entry e (get receiver e) provider))
+        (bps (match split-entry e (get bps e) u0))
+        (receiver-share (/ (* amount bps) BPS_DENOMINATOR))
+        (provider-share (- amount receiver-share))
+        (receiver-balance (get-user-balance receiver))
         (grace-period (var-get default-grace-period))
       )
         (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
@@ -293,7 +332,15 @@
             
             (map-set user-balances
               { user: provider }
-              { balance: (+ provider-balance amount) }
+              { balance: (+ provider-balance provider-share) }
+            )
+            
+            (if (> receiver-share u0)
+              (map-set user-balances
+                { user: receiver }
+                { balance: (+ receiver-balance receiver-share) }
+              )
+              true
             )
             
             (map-set subscriptions
