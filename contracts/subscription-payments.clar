@@ -123,6 +123,23 @@
   (map-get? subscription-tiers { provider: provider, tier-id: tier-id })
 )
 
+(define-read-only (preview-tier-subscription (provider principal) (tier-id uint) (interval uint))
+  (begin
+    (asserts! (> interval u0) ERR_INVALID_INTERVAL)
+    (match (get-tier provider tier-id)
+      tier
+        (ok {
+          provider: provider,
+          tier-id: tier-id,
+          amount: (get price tier),
+          interval: interval,
+          next-payment: (+ stacks-block-height interval)
+        })
+      ERR_TIER_NOT_FOUND
+    )
+  )
+)
+
 (define-read-only (get-subscription-tier (subscription-id uint))
   (match (map-get? subscription-tier-mapping { subscription-id: subscription-id })
     tier-mapping (get tier-id tier-mapping)
@@ -166,10 +183,13 @@
 )
 
 (define-public (withdraw (amount uint))
-  (let ((current-balance (get-user-balance tx-sender)))
+  (let (
+    (current-balance (get-user-balance tx-sender))
+    (recipient tx-sender)
+  )
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
-    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
     (map-set user-balances
       { user: tx-sender }
       { balance: (- current-balance amount) }
@@ -298,6 +318,68 @@
     )
 
     (ok subscription-id)
+  )
+)
+
+(define-public (create-subscription-for-tier (provider principal) (tier-id uint) (interval uint))
+  (begin
+    (asserts! (> interval u0) ERR_INVALID_INTERVAL)
+    (asserts! (is-none (map-get? user-subscriptions { user: tx-sender, provider: provider }))
+              ERR_SUBSCRIPTION_ALREADY_EXISTS)
+    (match (get-tier provider tier-id)
+      tier
+        (let (
+          (amount (get price tier))
+          (subscription-id (get-next-subscription-id))
+          (current-time stacks-block-height)
+        )
+          (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+
+          (map-set subscriptions
+            { subscription-id: subscription-id }
+            {
+              provider: provider,
+              subscriber: tx-sender,
+              amount: amount,
+              interval: interval,
+              created-at: current-time,
+              last-payment: u0,
+              next-payment: (+ current-time interval),
+              is-active: true,
+              total-payments: u0,
+              is-paused: false,
+              paused-at: u0,
+              total-pause-time: u0,
+              in-grace-period: false,
+              grace-period-start: u0,
+              grace-period-end: u0,
+              failed-payment-attempts: u0
+            }
+          )
+
+          (map-set user-subscriptions
+            { user: tx-sender, provider: provider }
+            { subscription-id: subscription-id }
+          )
+
+          (let ((current-provider-subs (default-to (list)
+                  (get subscription-ids (map-get? provider-subscriptions { provider: provider })))))
+            (map-set provider-subscriptions
+              { provider: provider }
+              { subscription-ids: (unwrap! (as-max-len? (append current-provider-subs subscription-id) u100)
+                                          ERR_SUBSCRIPTION_ALREADY_EXISTS) }
+            )
+          )
+
+          (map-set subscription-tier-mapping
+            { subscription-id: subscription-id }
+            { tier-id: tier-id }
+          )
+
+          (ok subscription-id)
+        )
+      ERR_TIER_NOT_FOUND
+    )
   )
 )
 
